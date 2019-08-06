@@ -1,0 +1,211 @@
+package br.com.vinter.operations.resposta;
+import static br.com.vinter.operations.Log.log;
+
+import java.io.StringReader;
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Date;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+
+import br.com.vinter.commons.utils.Jsons;
+import br.com.vinter.operations.Executor;
+import br.com.vinter.operations.Log;
+import br.com.vinter.operations.Respondedor;
+
+public class RespostaExecutor extends Executor {
+
+	boolean commitChanges;
+	boolean includeIdRespostaLimitation;
+	Respondedor currentRsp;
+	ChangeSilenceOperation changeSilence;
+	ChangePesquisaIteracaoOperation changePesquisaIteracao;
+	OverwriteUnformattedUtteranceOperation overwriteUnformattedUtterance;
+	VerificaQuantidadeContextos verificaQuantidadeContextos;
+	RegisterContextOperation registerContext;
+	ChangeCodigoAcaoTelaIdOperation changeCodigoAcaoTelaId;
+	BackupOperation backup;
+	ChangeFollowersIdsOperation changeFollowersIds;
+	
+	@Override
+	public String getConnectionURL() {
+		return currentRsp.url;
+	}
+	
+	public void execute(boolean commit) throws Exception {
+		this.backup.clear();
+
+		String sql = "select ID_RESPOSTA, FK_ID_RESPONDEDOR, ds_json from " + currentRsp.schema + ".tb_resposta ";
+		if (currentRsp.ids.length() > 0) {
+			sql += " where FK_ID_RESPONDEDOR in (" + currentRsp.ids + ") ";
+			if(includeIdRespostaLimitation) {
+				sql += " AND ID_RESPOSTA < 600 ";
+			}
+		} else if(includeIdRespostaLimitation) {
+			sql += " where ID_RESPOSTA < 600";
+		}
+		sql += " order by ID_RESPOSTA";
+		RecordsMaps records = select(sql);
+		
+		Connection connection = getConnection();
+		connection.setAutoCommit(false);
+		connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+		try {
+			for (RecordMap record : records) {
+				Integer id = ((BigDecimal) record.get("ID_RESPOSTA")).intValue();
+				Integer idRespondedor = ((BigDecimal) record.get("FK_ID_RESPONDEDOR")).intValue();
+				String jsonStr = record.getString("ds_json");
+				this.backup.add(idRespondedor, id, jsonStr);
+				JsonObject json;
+				boolean changed = false;
+				try {
+					json = Jsons.parseJsonObject(jsonStr);
+				} catch (Exception e) {
+					try {
+						json = Jsons.parseJsonObject(jsonStr.replace("\"\"", "\""));
+						changed = true;
+					} catch (Exception e1) {
+						log("ERRO ao fazer parse do json na resposta " + id + ": " + jsonStr);
+						throw e;
+					}
+				}
+				
+				if (json != null) {
+ 					for (JsonElement vigenciaElement : json.get("vigencias").getAsJsonArray()) {
+ 						if(registerContext != null) {
+ 							if(registerContext.adicionaContexto(id, vigenciaElement.getAsJsonObject())) {
+ 								changed = true;
+ 							}
+ 						}
+						
+						if(verificaQuantidadeContextos != null) {
+							verificaQuantidadeContextos.verificaContexto(id, vigenciaElement.getAsJsonObject());
+						}
+
+						for (JsonElement contextoElement : ((JsonObject)vigenciaElement).get("contextos").getAsJsonArray()) {
+							JsonObject contexto = (JsonObject) contextoElement;
+							
+							if(changeSilence != null) {
+								if (changeSilence.alterarSilencio(id, contexto)) {
+									changed = true;
+								}
+							}
+							
+							if(changePesquisaIteracao != null) {
+	 							if(changePesquisaIteracao.alterarPesquisaInteracao(id, contexto)) {
+									changed = true;
+								}
+							}
+							
+							if(overwriteUnformattedUtterance != null) {
+								if(overwriteUnformattedUtterance.overwriteUnformattedUtterance(id, contexto)) {
+									changed = true;
+								}
+							}
+							
+							if(changeCodigoAcaoTelaId != null) {
+								if(changeCodigoAcaoTelaId.alterarCodigoAcaoTelaId(id, contexto)) {
+									changed = true;
+								}
+							}
+						}
+ 					}
+ 					
+ 					if(changeFollowersIds != null) {
+ 						if(changeFollowersIds.changeFollowersIds(id,json)) {
+ 							changed = true;
+ 						}
+ 					}
+				}
+
+				if (changed) {
+					update(connection, id, idRespondedor, json);
+				}
+			}
+			if(commit) {
+				connection.commit();
+			} else {
+				connection.rollback();
+			}
+		} catch (Exception e) {
+			connection.rollback();
+			throw e;
+		} finally {
+			connection.close();
+			this.backup.writeToFile();
+		}
+	}
+
+	private void update(Connection connection, Integer id, Integer idRespondedor, JsonObject json) throws Exception {
+		String sql = "update " + currentRsp.schema + ".tb_resposta set ds_json = ? where ID_RESPOSTA = " + id + " AND FK_ID_RESPONDEDOR = " + idRespondedor;
+		PreparedStatement statement = connection.prepareStatement(sql);
+		String jsonValue = json.toString();
+		StringReader reader = new StringReader(jsonValue);
+		statement.setCharacterStream(1, reader, jsonValue.length());
+		statement.executeUpdate();
+		statement.close();
+	}
+	
+	public static void main(String[] args) throws Exception {
+		for (Respondedor r : rspArray) {
+			Log.reloadLogs();
+			log("Executando em " + r.url);
+
+			RespostaExecutor u = new RespostaExecutor();
+			u.currentRsp = r; 
+			u.backup = new BackupOperation("/tmp/backup/backup" + r.ids + "-" + new SimpleDateFormat("yyyy-MM-dd-HH-mm-ss").format(new Date()) + ".txt");
+			u.configureOperations();
+			u.execute(u.commitChanges);	
+			Log.writeToFile("/tmp/logs/update-" + r.ids + "-" + r.url.replace(":", "_").replace(".", "_").replace("/", "_").replace("@", "_") + ".txt");
+		}
+		log("FINALIZADO!!!");
+	}
+
+	public static Respondedor[] rspArray = new Respondedor[] {
+			new Respondedor("138", "PEPSICO_SILVER_OLTP", "jdbc:oracle:thin:devs/d3v$4v1@oltpprod01.virtualinteractions.com.br:1521/pdb1.590035034.oraclecloud.internal"),
+			//new Respondedor("", "MERCANTIL_GOLD_OLTP", "jdbc:oracle:thin:devs/d3v$4v1@oltpprod01.virtualinteractions.com.br:1521/pdb1.590035034.oraclecloud.internal"),
+			//new Respondedor("110", "VINTER_SANDBOX_OLTP", "jdbc:oracle:thin:VINTER_SANDBOX_OLTP/VINTER_SANDBOX_OLTP@oltp1.virtualinteractions.com.br:1521:ORCL"),
+			//new Respondedor("38", "KROTON_SILVER_OLTP", "jdbc:oracle:thin:devs/HwG4IDK7@oltpprod01.virtualinteractions.com.br:1521/pdb1.590035034.oraclecloud.internal")
+			//new Respondedor("114", "GSK_SILVER_OLTP", "jdbc:oracle:thin:GSK_SILVER_OLTP/zQBhKqX5@oltpprod01.virtualinteractions.com.br:1521/pdb1.590035034.oraclecloud.internal")
+			//new Respondedor("114", "GSK_GOLD_OLTP", "jdbc:oracle:thin:GSK_GOLD_OLTP/q3V0XnXQ@oltpprod01.virtualinteractions.com.br:1521/pdb1.590035034.oraclecloud.internal")
+	};
+
+	/**
+	 * Configura as operações a serem executadas.
+	 * Para desabilitar uma operação, basta setar o atributo correspondente para nulo.
+	 */
+	private void configureOperations() {
+		// True = Faz commit no final da transação
+		// False = Faz rollback no final da transações
+		this.commitChanges = false;
+		
+		this.includeIdRespostaLimitation = false;
+
+		// Reconfigura informações de silêncio. (newTimeout, newMensagem, newNumeroMax)
+		this.changeSilence = new ChangeSilenceOperation(720000, null, null, null);
+		
+		// Reconfigura Pesquisa de Interação // (Boolean enabled, int minimumId, int maximumId)
+		this.changePesquisaIteracao = null;//new ChangePesquisaIteracaoOperation(true, -1, 599);
+		
+		// Sobreescreve resposta do operador
+		this.overwriteUnformattedUtterance = null; //new OverwriteUnformattedUtteranceOperation();
+		
+		// Registra um novo contexto com foward de AskId
+		this.registerContext = null; //new RegisterContextOperation(50, contextMap);
+
+		// Verifica a quantidade de contextos por Vingência / Resposta
+		this.verificaQuantidadeContextos = null; //new VerificaQuantidadeContextos();
+		
+		// Altera o Código de Ação da Tela 
+		this.changeCodigoAcaoTelaId = null; //new ChangeCodigoAcaoTelaIdOperation(38, Arrays.asList("21","72","73","74","75","76","77","78","79","80","81","82","83","84","85","86","87","88","89","90","91","92","93","94","95","96","97","98","99","100","101","102","103","104","105","106","107","108"));
+		
+		// isAdd == true (adiciona)
+		// isAdd == false (remove)
+		// Adiciona ou remove seguidores em todos os IDs de resposta (boolean isAdd, List<Integer> followers)
+		this.changeFollowersIds = null; //new ChangeFollowersIdsOperation(true, Arrays.asList(26,36));
+	}
+}
